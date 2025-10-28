@@ -6,6 +6,9 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include <pthread.h>
+
 
 #ifdef __APPLE__
 #include "./endian.h"
@@ -14,14 +17,120 @@
 #endif
 
 #include "./peer.h"
+#include "common.h"
+#include "compsys_helpers.h"
 
 
 // Global variables to be used by both the server and client side of the peer.
 // Note the addition of mutexs to prevent race conditions.
 NetworkAddress_t *my_address;
-
 NetworkAddress_t** network = NULL;
 uint32_t peer_count = 0;
+pthread_mutex_t network_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* -------------------------------------------------------------------------
+ * Signature calculation
+ *-------------------------------------------------------------------------- */ 
+void get_signature(void* password, int password_len, char* salt, hashdata_t hash){
+    if (!password || !salt) return;
+
+    // Create a buffer big enough to hold password + salt
+    int combined_len = password_len + SALT_LEN; // Inputs should be valid
+    char *buf = malloc(combined_len);
+    if(!buf){
+        fprintf(stderr, "Memory allocation failed  in get_signature");
+        return;
+    }
+
+    // Copy password, then append salt
+    memcpy(buf, password, password_len);
+    memccpy(buf + password_len, salt, SALT_LEN)
+
+    // Hashing the combined buffer with SHA-256
+    get_data_sha(buf, hash, combined_len, SHA256_HASH_SIZE);
+
+    // Clean up temporary buffer
+    free(buf);
+}
+
+/* --------------------------------------------------------------------------
+ * Generic response sender
+ * ---------------------------------------------------------------------------  */
+void send_response(uint32_t connfd, uint32_t status, char* response_body, int response_length){
+    if (response_length > MAX_MSG_LEN){
+        fprintf(stderr, "Response to large to send\n");
+        return;
+    }
+
+    ReplyHeader_t reply;
+    memset(&reply, 0, sizeof(reply));
+
+    reply.length = htonl(response_length);
+    reply.status = htonl(status);
+    reply.this_block = htonl(1);
+    reply.block_count = htonl(1);
+
+    // Hash the body to fill block_hash and total_hash
+    hashdata_t body_hash;
+    get_data_sha(response_body, body_hash, response_length, SHA256_HASH_SIZE);
+    memcpy(reply.block_hash, body_hash, SHA256_HASH_SIZE);
+    memcpy(reply.total_hash, body_hash, SHA256_HASH_SIZE);
+
+    // Write header then body
+    compsys_helper_writen(connfd, &reply, REPLY_HEADER_LEN);
+    if (response_length > 0){
+        compsys_helper_writen(connfd, response_body, response_length);
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Reads and validates the reply from another peer after sending register
+ * -------------------------------------------------------------------------*/
+void parse_register_response(int connfd){
+
+}
+
+/* -------------------------------------------------------------------------
+ * Creates and sends a network request to another peer
+ * -------------------------------------------------------------------------*/
+void send_message(NetworkAddress_t peer_address, int command, 
+                    char* request_body, int request_len){
+    
+    // Convert port int to string for helper function
+    char port_str[PORT_STR_LEN];
+    snprintf(port_str, size_of(port_str), "%u", peer_address.port);
+
+    // Open client connection
+    int connfd = compsys_helper_open_clientfd(peer_address.ip, port_str);
+    if (connfd < 0){
+        fprintf(stderr, "Unable to connect to %s:%s\n", peer_address.ip, port_str);
+        return;
+    }
+
+    // Assemble request header
+    ReplyHeader_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.ip, my_address->ip, IP_LEN);
+    req.port = htonl(my_address->port);
+    memcpy(req.signature, my_address->signature, SHA256_HASH_SIZE);
+    req.command = htonl(command);
+    req.length = htonl(request_len);
+
+    // Send header then optional body
+    compsys_helper_writen(connfd, &req, REQUEST_HEADER_LEN);
+    if (request_len > 0 && request_body){
+        compsys_helper_writen(connfd, request_body, request_len);
+    }
+
+    // Expect a response for REGISTER command
+    if (command == COMMAND_REGISTER){
+        parse_register_response(connfd);
+    }
+
+    close(connfd);
+}
+
+
 
 /*
  * Function to act as thread for all required client interactions. This thread 
