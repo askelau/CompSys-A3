@@ -177,9 +177,10 @@ void parse_register_response(int connfd){
         network[peer_count++] = new_peer;
     }
 
+    fprintf(stdout, "Register reponse parsed: %u peers now known\n", peer_count);
     pthread_mutex_unlock(&network_lock);
     free(body); // Clean up memory
-    fprintf(stdout, "Register reponse parsed: %u peers now known\n", peer_count);
+    
 }
 
 /* -------------------------------------------------------------------------
