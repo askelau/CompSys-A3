@@ -18,6 +18,12 @@
 #define COMMAND_RETREIVE        2
 #define COMMAND_INFORM          3
 
+#define COMMAND_FILE_REQUEST   70
+#define COMMAND_FILE_RESPONSE  71
+
+#define STATUS_NOT_FOUND       72
+#define STATUS_DENIED          73
+
 #define STATUS_OK               1
 #define STATUS_PEER_EXISTS      2
 #define STATUS_PEER_MISSING     3

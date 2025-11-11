@@ -28,6 +28,179 @@ NetworkAddress_t** network = NULL;      // Number of known peers in network
 uint32_t peer_count = 0;
 pthread_mutex_t network_lock = PTHREAD_MUTEX_INITIALIZER;
 
+void send_message(NetworkAddress_t peer_address, int command, char* request_body, int request_len);
+void send_response(uint32_t connfd, uint32_t status, char* response_body, int response_length);
+
+static void inform_network_about_new_peer(const NetworkAddress_t *new_peer) {
+    if (!new_peer) return;
+
+    char body[PEER_ADDR_LEN];
+    memset(body, 0, sizeof(body));
+
+    memcpy(body, new_peer->ip, IP_LEN);
+    uint32_t port_net = htonl(new_peer->port);
+    memcpy(body + 16, &port_net, 4);
+    memcpy(body + 20, new_peer->signature, SHA256_HASH_SIZE);
+    memcpy(body + 20 + SHA256_HASH_SIZE, new_peer->salt, SALT_LEN);
+
+    pthread_mutex_lock(&network_lock);
+
+    if (peer_count <= 1) {
+        pthread_mutex_unlock(&network_lock);
+        return;
+    }
+    
+    for (uint32_t i = 0; i < peer_count; i++) {
+        NetworkAddress_t *peer = network[i];
+
+        if (string_equal(peer->ip, new_peer->ip) && peer->port == new_peer->port)
+            continue;
+
+        send_message(*peer, COMMAND_INFORM, body, sizeof(body));
+    }
+    pthread_mutex_unlock(&network_lock);
+
+    fprintf(stdout, "Broadcasted INFORM about %s:%u to all peers.\n",
+            new_peer->ip, new_peer->port);
+}
+
+static void handle_inform_request(int connfd, RequestHeader_t *req) {
+    uint32_t body_len = ntohl(req->length);
+    if (body_len != PEER_ADDR_LEN) {
+        fprintf(stderr, "Malformed INFORM body (expected %d, got %u)\n",
+                PEER_ADDR_LEN, body_len);
+        close(connfd);
+        return;
+    }
+
+    char body[PEER_ADDR_LEN];
+    if (compsys_helper_readn(connfd, body, PEER_ADDR_LEN) != PEER_ADDR_LEN) {
+        fprintf(stderr, "Failed to read INFORM body\n");
+        close(connfd);
+        return;
+    }
+
+    char ip[IP_LEN] = {0};
+    memcpy(ip, body, IP_LEN);
+
+    uint32_t port_net = 0;
+    memcpy(&port_net, body + 16, 4);
+    uint32_t port = ntohl(port_net);
+
+    hashdata_t signature;
+    memcpy(signature, body + 20, SHA256_HASH_SIZE);
+
+    char salt[SALT_LEN];
+    memcpy(salt, body + 20 + SHA256_HASH_SIZE, SALT_LEN);
+
+    pthread_mutex_lock(&network_lock);
+
+    for (uint32_t i = 0; i < peer_count; i++) {
+        if (string_equal(network[i]->ip, ip) && network[i]->port == port) {
+            pthread_mutex_unlock(&network_lock);
+            close(connfd);
+            return;
+        }
+    }
+
+    NetworkAddress_t *new_peer = malloc(sizeof(NetworkAddress_t));
+    memset(new_peer, 0, sizeof(NetworkAddress_t));
+    strncpy(new_peer->ip, ip, IP_LEN - 1);
+    new_peer->port = port;
+    memcpy(new_peer->signature, signature, SHA256_HASH_SIZE);
+    memcpy(new_peer->salt, salt, SALT_LEN);
+
+    network = realloc(network, sizeof(NetworkAddress_t*) * (peer_count + 1));
+    network[peer_count++] = new_peer;
+    pthread_mutex_unlock(&network_lock);
+
+    fprintf(stdout, "Received INFORM: added new peer %s:%u (total %u)\n",
+            ip, port, peer_count);
+
+    close(connfd);
+}
+
+static void handle_file_request(int connfd, RequestHeader_t *req) {
+    uint32_t body_len = ntohl(req->length);
+    if (body_len == 0 || body_len > MAX_MSG_LEN) { close(connfd); return; }
+
+    char filename[256] = {0};
+    if (body_len >= sizeof(filename)) body_len = sizeof(filename) - 1;
+    if (compsys_helper_readn(connfd, filename, body_len) != (int)body_len) { close(connfd); return; }
+
+    fprintf(stdout, "\nPeer %s:%u is requesting file '%s'.\n",
+            req->ip, ntohl(req->port), filename);
+
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) { send_response(connfd, STATUS_NOT_FOUND, NULL, 0); close(connfd); return; }
+
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); close(connfd); return; }
+    long fsize = ftell(fp);
+    if (fsize < 0 || fsize > MAX_MSG_LEN) { fclose(fp); close(connfd); return; }
+    rewind(fp);
+
+    char *buffer = malloc((size_t)fsize);
+    if (!buffer) { fclose(fp); close(connfd); return; }
+    size_t nread = fread(buffer, 1, (size_t)fsize, fp);
+    fclose(fp);
+    if (nread != (size_t)fsize) { free(buffer); close(connfd); return; }
+
+    
+    fprintf(stdout, "Automatically sending '%s'...\n", filename);
+
+    send_response(connfd, STATUS_OK, buffer, (int)fsize);
+    free(buffer);
+
+    shutdown(connfd, SHUT_WR);
+    char tmp[1];
+    while (read(connfd, tmp, 1) > 0) {}
+    close(connfd);
+
+    fprintf(stdout, "Successfully sent file '%s'\n", filename);
+}
+
+
+void handle_file_response(int connfd, const char *requested_filename) {
+    ReplyHeader_t header;
+    if (compsys_helper_readn(connfd, &header, REPLY_HEADER_LEN) != REPLY_HEADER_LEN) {
+        fprintf(stderr, "Failed to read FILE_RESPONSE header\n");
+        return;
+    }
+
+    uint32_t body_len = ntohl(header.length);
+    uint32_t status = ntohl(header.status);
+
+    if (status == STATUS_NOT_FOUND) {
+        fprintf(stdout, "Peer replied: File '%s' not found.\n", requested_filename);
+        return;
+    }
+
+    if (body_len == 0 || body_len > MAX_MSG_LEN) {
+        fprintf(stderr, "Invalid FILE_RESPONSE body length\n");
+        return;
+    }
+
+    char *body = malloc(body_len);
+    if (compsys_helper_readn(connfd, body, body_len) != (int)body_len) {
+        fprintf(stderr, "Failed to read FILE_RESPONSE body\n");
+        free(body);
+        return;
+    }
+
+    FILE *fp = fopen(requested_filename, "wb");
+    if (fp) {
+        fwrite(body, 1, body_len, fp);
+        fclose(fp);
+        fprintf(stdout, "File '%s' received and saved (%u bytes).\n", requested_filename, body_len);
+    } else {
+        fprintf(stderr, "Failed to save '%s'\n", requested_filename);
+    }
+
+    free(body);
+}
+
+
+
 /* -------------------------------------------------------------------------
  * Creates a salted SHA-256 hash signature for a password
  *-------------------------------------------------------------------------- */ 
@@ -214,12 +387,11 @@ void send_message(NetworkAddress_t peer_address, int command,
     if (request_len > 0 && request_body){
         compsys_helper_writen(connfd, request_body, request_len);
     }
-
-    // Expect a response for REGISTER command
-    if (command == COMMAND_REGISTER){
+    if (command == COMMAND_REGISTER) {
         parse_register_response(connfd);
+    } else if (command == COMMAND_FILE_REQUEST) {
+        handle_file_response(connfd, request_body);
     }
-
     close(connfd);
 }
 
@@ -288,6 +460,8 @@ void handle_register_request(int connfd, RequestHeader_t* req){
     send_response(connfd, STATUS_OK, body, body_len);
     free(body);
     close(connfd);
+
+    inform_network_about_new_peer(new_peer);
 }
 
 /* -------------------------------------------------------------------------
@@ -312,6 +486,12 @@ void* handle_server_request_thread(void* arg){
     switch(command){
         case COMMAND_REGISTER:
             handle_register_request(connfd, &req);
+            break;
+        case COMMAND_INFORM:
+            handle_inform_request(connfd, &req);
+            break;
+        case COMMAND_FILE_REQUEST:
+            handle_file_request(connfd, &req);
             break;
         default:
             fprintf(stderr, "Unknown command: %u\n", command);
@@ -361,6 +541,32 @@ void* client_thread() {
     // Send REGISTER request to the specified peer
     send_message(peer_address, COMMAND_REGISTER, NULL, 0);
 
+    while (1) {
+        char target_ip[IP_LEN];
+        char target_port_str[PORT_STR_LEN];
+        char filename[256];
+
+        fprintf(stdout, "\nEnter IP of peer to request file from (or 'exit' to quit): ");
+        scanf("%16s", target_ip);
+        if (strcmp(target_ip, "exit") == 0)
+            break;
+
+        fprintf(stdout, "Enter port of that peer: ");
+        scanf("%8s", target_port_str);
+
+        fprintf(stdout, "Enter filename to request: ");
+        scanf("%255s", filename);
+
+        // Build target peer structure
+        NetworkAddress_t target;
+        memset(&target, 0, sizeof(target));
+        strncpy(target.ip, target_ip, IP_LEN);
+        target.port = atoi(target_port_str);
+
+        fprintf(stdout, "Requesting file '%s' from %s:%u...\n", filename, target.ip, target.port);
+        send_message(target, COMMAND_FILE_REQUEST, filename, strlen(filename));
+    }
+
     return NULL;
 }
 
@@ -409,6 +615,7 @@ void* server_thread() {
  * ------------------------------------------------------------------------------*/
 
 int main(int argc, char **argv) {
+
     // Users should call this script with a single argument describing what 
     // config to use
     if (argc != 3)
@@ -451,6 +658,12 @@ int main(int argc, char **argv) {
 
     // Compute salted signature
     get_signature(password, PASSWORD_LEN, my_address->salt, my_address->signature);
+
+    pthread_mutex_lock(&network_lock);
+    network = malloc(sizeof(NetworkAddress_t*));
+    network[0] = my_address;
+    peer_count = 1;
+    pthread_mutex_unlock(&network_lock);
 
     // Setup the client and server threads 
     pthread_t client_thread_id;
