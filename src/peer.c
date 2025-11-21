@@ -30,6 +30,8 @@ pthread_mutex_t network_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void send_message(NetworkAddress_t peer_address, int command, char* request_body, int request_len);
 void send_response(uint32_t connfd, uint32_t status, char* response_body, int response_length);
+void send_fragmented_response(int connfd, uint32_t status, const char *data, uint32_t data_len);
+void receive_fragmented_response(int connfd, const char *save_as);
 
 static void inform_network_about_new_peer(const NetworkAddress_t *new_peer) {
     if (!new_peer) return;
@@ -136,7 +138,7 @@ static void handle_file_request(int connfd, RequestHeader_t *req) {
 
     if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); close(connfd); return; }
     long fsize = ftell(fp);
-    if (fsize < 0 || fsize > MAX_MSG_LEN) { fclose(fp); close(connfd); return; }
+    if (fsize < 0) { fclose(fp); close(connfd); return; }
     rewind(fp);
 
     char *buffer = malloc((size_t)fsize);
@@ -148,7 +150,7 @@ static void handle_file_request(int connfd, RequestHeader_t *req) {
     
     fprintf(stdout, "Automatically sending '%s'...\n", filename);
 
-    send_response(connfd, STATUS_OK, buffer, (int)fsize);
+    send_fragmented_response(connfd, STATUS_OK, buffer, (uint32_t)fsize);
     free(buffer);
 
     shutdown(connfd, SHUT_WR);
@@ -230,36 +232,8 @@ void get_signature(void* password, int password_len, char* salt, hashdata_t hash
  * Sends a reply header + optional body to peer connection
  * ---------------------------------------------------------------------------  */
 void send_response(uint32_t connfd, uint32_t status, char* response_body, int response_length){
-    if (response_length > MAX_MSG_LEN){
-        fprintf(stderr, "Response to large to send\n");
-        return;
+    send_fragmented_response(connfd, status, response_body, response_length);
     }
-
-     // Initialize reply header
-    ReplyHeader_t reply;
-    memset(&reply, 0, sizeof(reply));
-    reply.length = htonl(response_length);
-    reply.status = htonl(status);
-    reply.this_block = htonl(1);
-    reply.block_count = htonl(1);
-
-     // Compute hash of the response body if present
-    hashdata_t body_hash;
-    if (response_length > 0 && response_body != NULL){
-        get_data_sha(response_body, body_hash, response_length, SHA256_HASH_SIZE);
-        memcpy(reply.block_hash, body_hash, SHA256_HASH_SIZE);  // For this block
-        memcpy(reply.total_hash, body_hash, SHA256_HASH_SIZE);  // For total message
-    } else {
-        // Zero hashes already from memset
-    }
-
-    // Send header
-    compsys_helper_writen(connfd, &reply, REPLY_HEADER_LEN);
-    // Send body if present
-    if (response_length > 0 && response_body){
-        compsys_helper_writen(connfd, response_body, response_length);
-    }
-}
 
 /* -------------------------------------------------------------------------
  * Reads and validates the reply from another peer after sending register
@@ -390,7 +364,7 @@ void send_message(NetworkAddress_t peer_address, int command,
     if (command == COMMAND_REGISTER) {
         parse_register_response(connfd);
     } else if (command == COMMAND_FILE_REQUEST) {
-        handle_file_response(connfd, request_body);
+        receive_fragmented_response(connfd, request_body);
     }
     close(connfd);
 }
@@ -609,6 +583,167 @@ void* server_thread() {
     close(listenfd);
     return NULL;
 }
+
+/* ============================================================
+ *  Helper: min()
+ * ============================================================ */
+static inline uint32_t min_u32(uint32_t a, uint32_t b) {
+    return (a < b) ? a : b;
+}
+
+/* ============================================================
+ *  SEND MULTI-BLOCK RESPONSE
+ * ============================================================ */
+void send_fragmented_response(int connfd, uint32_t status,
+                              const char *data, uint32_t data_len)
+{
+    const uint32_t header_size = REPLY_HEADER_LEN;
+    const uint32_t max_payload = MAX_MSG_LEN - header_size;
+
+    uint32_t block_count = (data_len + max_payload - 1) / max_payload;
+    if (block_count == 0) block_count = 1;
+
+    /* Precompute total hash */
+    hashdata_t total_hash = {0};
+    if (data_len > 0)
+        get_data_sha(data, total_hash, data_len, SHA256_HASH_SIZE);
+
+    uint32_t offset = 0;
+
+    for (uint32_t block = 0; block < block_count; block++) {
+        uint32_t remaining = data_len - offset;
+        uint32_t chunk = min_u32(remaining, max_payload);
+
+        ReplyHeader_t h;
+        memset(&h, 0, sizeof(h));
+
+        h.length      = htonl(chunk);
+        h.status      = htonl(status);
+        h.this_block  = htonl(block);
+        h.block_count = htonl(block_count);
+
+        if (chunk > 0) {
+            hashdata_t bh = {0};
+            get_data_sha(data + offset, bh, chunk, SHA256_HASH_SIZE);
+            memcpy(h.block_hash, bh, SHA256_HASH_SIZE);
+        }
+        memcpy(h.total_hash, total_hash, SHA256_HASH_SIZE);
+
+        /* Send header */
+        compsys_helper_writen(connfd, &h, REPLY_HEADER_LEN);
+
+        /* Send payload */
+        if (chunk > 0)
+            compsys_helper_writen(connfd, (char*)data + offset, chunk);
+
+        offset += chunk;
+    }
+}
+
+/* ============================================================
+ *  RECEIVE FRAGMENTED RESPONSE
+ * ============================================================ */
+void receive_fragmented_response(int connfd, const char *save_as)
+{
+    ReplyHeader_t h;
+
+    /* First header */
+    if (compsys_helper_readn(connfd, &h, REPLY_HEADER_LEN) != REPLY_HEADER_LEN) {
+        fprintf(stderr, "Failed to read first reply header\n");
+        return;
+    }
+
+    uint32_t first_len   = ntohl(h.length);
+    uint32_t status      = ntohl(h.status);
+    uint32_t block_count = ntohl(h.block_count);
+
+    if (status == STATUS_NOT_FOUND) {
+        fprintf(stdout, "File '%s' not found on peer.\n", save_as);
+        return;
+    }
+
+    if (block_count == 0) {
+        fprintf(stderr, "Malformed reply: block_count=0\n");
+        return;
+    }
+
+    /* Allocate table */
+    char **blocks = calloc(block_count, sizeof(char*));
+    uint32_t *sizes = calloc(block_count, sizeof(uint32_t));
+
+    for (uint32_t i = 0; i < block_count; i++) {
+        blocks[i] = NULL;
+        sizes[i] = 0;
+    }
+
+    /* Read block 0 payload */
+    char *body0 = malloc(first_len);
+    if (compsys_helper_readn(connfd, body0, first_len) != first_len) {
+        fprintf(stderr, "Failed to read block 0 body\n");
+        free(body0);
+        return;
+    }
+    blocks[0] = body0;
+    sizes[0] = first_len;
+
+    /* Read remaining blocks */
+    for (uint32_t i = 1; i < block_count; i++) {
+        ReplyHeader_t hi;
+        if (compsys_helper_readn(connfd, &hi, REPLY_HEADER_LEN) != REPLY_HEADER_LEN) {
+            fprintf(stderr, "Failed reading header for block %u\n", i);
+            continue;
+        }
+
+        uint32_t blen = ntohl(hi.length);
+        uint32_t idx  = ntohl(hi.this_block);
+
+        if (idx >= block_count) {
+            fprintf(stderr, "Illegal block index %u\n", idx);
+            continue;
+        }
+
+        blocks[idx] = malloc(blen);
+        sizes[idx] = blen;
+
+        if (compsys_helper_readn(connfd, blocks[idx], blen) != blen) {
+            fprintf(stderr, "Failed reading body for block %u\n", idx);
+            continue;
+        }
+    }
+
+    /* Reassemble */
+    uint32_t total_size = 0;
+    for (uint32_t i = 0; i < block_count; i++)
+        total_size += sizes[i];
+
+    char *full = malloc(total_size);
+    uint32_t pos = 0;
+    for (uint32_t i = 0; i < block_count; i++) {
+        memcpy(full + pos, blocks[i], sizes[i]);
+        pos += sizes[i];
+    }
+
+    /* Save */
+    FILE *fp = fopen(save_as, "wb");
+    if (fp) {
+        fwrite(full, 1, total_size, fp);
+        fclose(fp);
+        fprintf(stdout,
+            "Saved '%s' (%u bytes) using %u blocks.\n",
+            save_as, total_size, block_count
+        );
+    } else {
+        fprintf(stderr, "Failed to save %s\n", save_as);
+    }
+
+    /* Cleanup */
+    for (uint32_t i = 0; i < block_count; i++)
+        free(blocks[i]);
+    free(blocks);
+    free(sizes);
+    free(full);
+}
+
 
 /* -----------------------------------------------------------------------------
  * Main function 
